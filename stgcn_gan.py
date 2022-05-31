@@ -6,7 +6,6 @@ from scipy.sparse.linalg import eigs
 import pandas as pd
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import FNetConfig
 
 from config import device
 from stgcn_eval import multi_pred, stgcn_evaluate
