@@ -9,8 +9,6 @@ from torch.utils.data import DataLoader
 from transformers import FNetConfig
 
 from config import device
-from models import stgcn
-# from models import STGCN
 from stgcn_eval import multi_pred, stgcn_evaluate
 
 DATA_PATHS = {
