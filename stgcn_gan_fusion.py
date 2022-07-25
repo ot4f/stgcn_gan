@@ -13,6 +13,8 @@ DATA_PATHS = {
     "pems": {"feat": "data/PeMSD7_V_228.csv", "adj": "data/PeMSD7_W_228.csv"}
 }
 
+FLOAT_DTYPE = torch.float32
+
 def load_pems_data(dataset):
     pems_adj = pd.read_csv(dataset['adj'],header=None)
     W = pems_adj.values
@@ -109,6 +111,22 @@ def first_approx(W):
 #     else:
 #         return W
 
+@torch.jit.script
+def fused_sigmoid(x):
+    return torch.sigmoid(x)
+
+@torch.jit.script
+def fused_add(x,y):
+    return torch.add(x, y)
+
+@torch.jit.script
+def fused_mul(x, y):
+    return torch.mul(x,y)
+
+@torch.jit.script
+def fused_relu(x):
+    return F.relu(x)
+
 
 ########################
 class Gconv(nn.Module):
@@ -145,7 +163,7 @@ class Gconv(nn.Module):
         :param adj: ndarray, shape [batch, seq_len, n_route, n_route]
         :return: tensor, [batch, seq_len, n_route, c_out].
         """
-        
+        # import pdb; pdb.set_trace()
         batch_size, seq_len, n_route, _ = x.shape
         # print(x.shape)
         # adj = adj.reshape(-1, n_route, n_route)
@@ -157,11 +175,11 @@ class Gconv(nn.Module):
         # import pdb; pdb.set_trace()
         # laplacian = torch.FloatTensor(np.stack(laps)).to(device)
         # laplacian = laplacian.reshape(batch_size, seq_len, n_route, -1)
-        eye = torch.eye(n_route).to(device).unsqueeze(0).unsqueeze(0).\
+        eye = torch.eye(n_route,device=device,dtype=FLOAT_DTYPE).unsqueeze(0).unsqueeze(0).\
             expand(batch_size, seq_len, n_route, n_route)
         # print(adj.shape, eye.shape)
-        adjacency = adj + eye
-        diag = adjacency.sum(dim=-1, keepdim=True).pow(-0.5).expand(adjacency.size()) * eye
+        adjacency = fused_add(adj, eye)
+        diag = fused_mul(adjacency.sum(dim=-1, keepdim=True).pow(-0.5).expand(adjacency.size()), eye)
         adjacency = diag.matmul(adjacency).matmul(diag)
 
         weights = self.weights.unsqueeze(0).expand(batch_size, seq_len, self.c_in, self.c_out)
@@ -200,10 +218,12 @@ class TemporalConv(nn.Module):
         
         x = x.permute(0, 3, 1, 2).contiguous() # [batch_size, c_in, time_step, n_route]
 
+        # print(x.dtype)
+
         if self.c_in > self.c_out:
             x_input = self.conv1(x)
         elif self.c_in < self.c_out:
-            x_input = torch.cat([x, torch.zeros(x.shape[0], self.c_out - self.c_in, T, n).to(device)], dim=1)
+            x_input = torch.cat([x, torch.zeros(x.shape[0], self.c_out - self.c_in, T, n, device=device, dtype=FLOAT_DTYPE)], dim=1)
         else:
             x_input = x
         
@@ -211,18 +231,20 @@ class TemporalConv(nn.Module):
         x_input = x_input[:, :, :T, :]
 
         x_conv = self.conv2(x)
+        torch.cuda.nvtx.range_push("before_GLU")
         if self.act_func == 'GLU':
-            x_output = (x_conv[:, 0:self.c_out, :, :] + x_input) * torch.sigmoid(x_conv[:, self.c_out:, :, :])
+            x_output = fused_mul(fused_add(x_conv[:, 0:self.c_out, :, :], x_input), fused_sigmoid(x_conv[:, self.c_out:, :, :]))
         else:
             if self.act_func == 'linear':
                 x_output = x_conv
             elif self.act_func == 'sigmoid':
-                x_output = torch.sigmoid(x_conv)
+                x_output = fused_sigmoid(x_conv)
             elif self.act_func == 'relu':
-                x_output = F.relu(x_conv + x_input)
+                x_output = fused_relu(fused_add(x_conv, x_input))
             else:
                 raise ValueError(f'ERROR: activation function "{self.act_func}" is not defined.')
         x_output = x_output.permute(0, 2, 3, 1)
+        torch.cuda.nvtx.range_pop()
 
         return x_output
 
@@ -252,7 +274,7 @@ class TemporalConv1(nn.Module):
         if self.c_in > self.c_out:
             x_input = self.conv1(x)
         elif self.c_in < self.c_out:
-            x_input = torch.cat([x, torch.zeros(x.shape[0], self.c_out - self.c_in, T, n).to(device)], dim=1)
+            x_input = torch.cat([x, torch.zeros(x.shape[0], self.c_out - self.c_in, T, n, device=device,dtype=FLOAT_DTYPE)], dim=1)
         else:
             x_input = x
         
@@ -261,14 +283,14 @@ class TemporalConv1(nn.Module):
 
         x_conv = self.conv2(x)
         if self.act_func == 'GLU':
-            x_output = (x_conv[:, 0:self.c_out, :, :] + x_input) * torch.sigmoid(x_conv[:, self.c_out:, :, :])
+            x_output = fused_mul(fused_add(x_conv[:, 0:self.c_out, :, :], x_input), fused_sigmoid(x_conv[:, self.c_out:, :, :]))
         else:
             if self.act_func == 'linear':
                 x_output = x_conv
             elif self.act_func == 'sigmoid':
-                x_output = torch.sigmoid(x_conv)
+                x_output = fused_sigmoid(x_conv)
             elif self.act_func == 'relu':
-                x_output = F.relu(x_conv + x_input)
+                x_output = fused_relu(fused_add(x_conv,x_input))
             else:
                 raise ValueError(f'ERROR: activation function "{self.act_func}" is not defined.')
         x_output = x_output.permute(0, 2, 3, 1)
@@ -296,14 +318,14 @@ class SpatioConv(nn.Module):
         if self.c_in > self.c_out:
             x_input = self.conv1(x.permute(0,3,1,2)).permute(0,2,3,1)
         elif self.c_in < self.c_out:
-            x_input = torch.cat([x, torch.zeros(x.shape[0], T, n, self.c_out - self.c_in).to(device)], dim=1)
+            x_input = torch.cat([x, torch.zeros(x.shape[0], T, n, self.c_out - self.c_in, device=device, dtype=FLOAT_DTYPE)], dim=1)
         else:
             x_input = x
         
         # x = x.reshape(-1, n, self.c_in)
         x = self.gconv(x, adj)
         # x = x.reshape(-1, T, n, self.c_out)
-        x = F.relu(x[:, :, :, 0:self.c_out] + x_input)
+        x = fused_relu(fused_add(x[:, :, :, 0:self.c_out],x_input))
         return x
 
 
@@ -401,7 +423,7 @@ class Generator(nn.Module):
         # import pdb; pdb.set_trace()
         torch.cuda.nvtx.range_push("before_generator")
         batch_size, seq_len, n_route, _ = x.shape
-        noise_weight = (0.99*torch.rand(batch_size, seq_len, n_route, n_route).to(device)+0.01)
+        noise_weight = (0.99*torch.rand(batch_size, seq_len, n_route, n_route, device=device, dtype=FLOAT_DTYPE)+0.01)
         noise_weight = (noise_weight+noise_weight.transpose(2,3))/2.0
         w = noise_weight * adj
         output = self.stgcn(x, w)
@@ -468,8 +490,10 @@ def train():
         for j, data in enumerate(train_loader):
             step += 1
             train_x, train_y = data
-            train_x = train_x.to(device)
-            train_y = train_y.to(device)
+            train_x = train_x.type(FLOAT_DTYPE).to(device)
+            train_y = train_y.type(FLOAT_DTYPE).to(device)
+
+            # print(train_x.dtype, train_y.dtype)
             
             for _ in range(n_critic):
                 fake_y = generator(train_x, A)
@@ -508,10 +532,10 @@ def train():
         if lr_scheduler_on:
             vis.plot_many_stack(epoch+1, {'g_lr': opt_gen.param_groups[0]['lr'], 
             'd_lr': opt_critic.param_groups[0]['lr']}, xlabel='epoch')
-            if (epoch+1) % gen_step == 0:
-                gen_lr_scheduler.step()
-            if (epoch+1) % critic_step == 0:
-                critic_lr_scheduler.step()
+            # if (epoch+1) % gen_step == 0:
+            gen_lr_scheduler.step()
+            # if (epoch+1) % critic_step == 0:
+            critic_lr_scheduler.step()
         
 
 if __name__ == '__main__':
@@ -549,6 +573,9 @@ if __name__ == '__main__':
     generator = Generator(n_route_, 12, 3, 3, blocks, 0.5, 'GLU')
     discriminator = Discriminator(n_route_*1, 512)
     
+    if FLOAT_DTYPE == torch.float16:
+        generator.half()
+        discriminator.half()
     generator.to(device)
     discriminator.to(device)
 
@@ -564,7 +591,7 @@ if __name__ == '__main__':
     # scale = x_stats['std']
     # bias = x_stats['mean']
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     
@@ -575,15 +602,15 @@ if __name__ == '__main__':
     opt_gen = torch.optim.RMSprop(generator.parameters(), lr=initial_lr, weight_decay=0)
     opt_critic = torch.optim.RMSprop(discriminator.parameters(), lr=initial_lr, weight_decay=0)
     
-    gen_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(opt_gen, gamma=0.7, last_epoch=-1)
-    critic_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(opt_critic, gamma=0.7, last_epoch=-1)
+    gen_lr_scheduler = torch.optim.lr_scheduler.StepLR(opt_gen, step_size=10, gamma=0.7, last_epoch=-1)
+    critic_lr_scheduler = torch.optim.lr_scheduler.StepLR(opt_critic, step_size=10, gamma=0.7, last_epoch=-1)
 
     lr_scheduler_on = args.lr_scheduler
     n_critic = 5
-    gen_step = 10
-    critic_step = 10
+    # gen_step = 10
+    # critic_step = 10
 
-    A = torch.FloatTensor(A).to(device)
+    A = torch.from_numpy(A).type(FLOAT_DTYPE).to(device)
 
     if testing:
         generator.load_state_dict(torch.load('output/stgcn_gan_%d.pth' % n_epoch))
